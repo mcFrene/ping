@@ -1,23 +1,19 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <iostream>
-#include <thread>
-#include <chrono>
 #include <cstring>
+#include <vector>
 
 #pragma comment(lib, "ws2_32.lib")
-#pragma warning(disable:4996);
+#pragma warning(disable:4996)
 
 using namespace std;
 
-const short data_size = 32;
-const short max_data_size = 64;
+const short max_data_size = 72;
 const short packets_qty = 4;
-const short ttl = 30;
+const short default_ttl = 2;
 const short timeout = 4000;
 const short send_interval = 1000;
-
-const char symbols[]  = "abcdefghijklmnopqrstuvwxyz0123456789";
 
 const BYTE ICMP_ECHO_REQUEST = 8;
 const BYTE ICMP_DEST_UNREACH = 3;
@@ -25,64 +21,27 @@ const BYTE ICMP_TTL_EXPIRE = 11;
 const BYTE ICMP_ECHO_REPLY = 0;
 
 const short PING_SUCCESS = 0;
-const short STOP_PING = 1;
-const short IP_FAILED = 2;
-const short SELECT_FAILED = 3;
+const short IP_FAILED = 1;
+const short SELECT_FAILED = 2;
+const short SEND_FAILED = 3;
 
 
-class icmp_packet{
-    void generate_random_data(BYTE* data, short length){
-        for(short i=0; i<length; i++){
-            data[i] = symbols[rand() % (sizeof(symbols) - 1)];
-        }
-        data[length] = '\0';
-    }
-
-    USHORT generate_checksum(USHORT* buffer, int size) {
-        unsigned long cksum = 0;
-
-        while (size > 1){
-            cksum += *buffer++;
-            size -= sizeof(USHORT);
-        }
-        if (size){
-            cksum += *(UCHAR*)buffer;
-        }
-
-        cksum = (cksum >> 16) + (cksum & 0xffff);
-        cksum += (cksum >> 16);
-
-        return (USHORT)(~cksum);
-    }
-
-public:
+struct icmp_packet{
     BYTE type;
     BYTE code;
     USHORT checksum;
     USHORT id;
     USHORT seq;
-    BYTE data[max_data_size + 1];
-
-    icmp_packet(BYTE type, BYTE code, USHORT id, USHORT seq){
-        this->type = type;
-        this->code = code;
-        this->checksum = 0;
-        this->id = id;
-        this->seq = seq;
-        generate_random_data(this->data, data_size);
-        this->checksum = generate_checksum((USHORT*)this, data_size + 8);
-    }
-
-    int send_packet(SOCKET sd, sockaddr_in dest, int delay=0){
-
-
-        this_thread::sleep_for(chrono::milliseconds(delay));
-        return sendto(sd, (char*)this, data_size + 8, 0,(sockaddr*)&dest, sizeof(dest));
-    }
+    GUID data;
 };
 
-class ip_packet {
-public:
+struct packets_time{
+    struct icmp_packet* packet;
+    int time;
+    bool status;
+};
+
+struct ip_packet{
     BYTE h_len_version;
     BYTE tos;
     USHORT total_len;
@@ -93,48 +52,60 @@ public:
     USHORT checksum;
     ULONG source_ip;
     ULONG dest_ip;
-    icmp_packet icmp = icmp_packet(0, 0, 0, 0);
-
-    int recv_packet(SOCKET sd, sockaddr_in source){
-        int fromlen = sizeof(source);
-        return recvfrom(sd, (char*)this, sizeof(ip_packet), 0, (sockaddr*)&source, &fromlen);
-    }
-
-    bool is_mine(BYTE type, icmp_packet* packets_to_send[], int* times, int packets_qty, USHORT seq){
-        if(seq >= packets_qty || !times[seq] || times[seq] == -1)
-            return false;
-
-        if(this->icmp.type == ICMP_ECHO_REPLY){
-            return strcmp(
-                reinterpret_cast<const char*>(packets_to_send[seq]->data),
-                reinterpret_cast<const char*>(this->icmp.data)) == 0;
-        }
-        else{
-            ip_packet* err_packet = (ip_packet*)this->icmp.data;
-            return err_packet->icmp.type == packets_to_send[seq]->type &&
-                err_packet->icmp.code == packets_to_send[seq]->code &&
-                err_packet->icmp.id == packets_to_send[seq]->id &&
-                err_packet->icmp.seq == packets_to_send[seq]->seq &&
-                err_packet->icmp.checksum == packets_to_send[seq]->checksum;
-        }
-    }
+    icmp_packet icmp;
 };
 
-bool is_all_processed(int* times, int packets_qty){
+USHORT generate_checksum(USHORT* buffer, int size) {
+    unsigned long cksum = 0;
+
+    while (size > 1){
+        cksum += *buffer++;
+        size -= sizeof(USHORT);
+    }
+    if (size){
+        cksum += *(UCHAR*)buffer;
+    }
+
+    cksum = (cksum >> 16) + (cksum & 0xffff);
+    cksum += (cksum >> 16);
+
+    return (USHORT)(~cksum);
+}
+
+void icmp_packet_init(icmp_packet* packet, BYTE type, BYTE code, USHORT id, USHORT seq){
+    packet->type = type;
+    packet->code = code;
+    packet->checksum = 0;
+    packet->id = id;
+    packet->seq = seq;
+    CoCreateGuid(&packet->data);
+    packet->checksum = generate_checksum((USHORT*)packet, sizeof(icmp_packet));
+}
+
+int send_packet(icmp_packet* packet, SOCKET sd, sockaddr_in dest){
+    return sendto(sd, (char*)packet, sizeof(icmp_packet), 0,(sockaddr*)&dest, sizeof(dest));
+}
+
+int receive_packet(BYTE* recieve_buffer, SOCKET sd, sockaddr_in source){
+    int fromlen = sizeof(source);
+    return recvfrom(sd, (char*)recieve_buffer, max_data_size, 0, (sockaddr*)&source, &fromlen);
+}
+
+bool is_all_processed(vector<packets_time>& packets_to_send, int packets_qty){
     for(int i=0; i<packets_qty; i++){
-        if(times[i] && times[i] != -1)
+        if(!packets_to_send[i].status)
             return false;
     }
     return true;
 }
 
-void print_stat(int* times, int packets_qty, char* ip){
+void print_stat(vector<packets_time>& packets_to_send, int packets_qty, char* ip){
     int rec_qty = 0;
     int lost_qty = 0;
     for(int i=0; i<packets_qty; i++){
-        if(!times[i])
+        if(packets_to_send[i].status)
             rec_qty++;
-        else if(times[i] == -1)
+        else
             lost_qty++;
     }
 
@@ -143,41 +114,20 @@ void print_stat(int* times, int packets_qty, char* ip){
     cout<<"(lost "<<int(lost_qty*100/packets_qty)<<"%)"<<endl<<endl;
 }
 
-short ping(SOCKET sd, sockaddr_in &dest, sockaddr_in& source){
-    char ip[32];
-    cout<<"Enter IP to ping : ";
-    cin>>ip;
-
-    if(strcmp(ip, "stop") == 0)
-        return STOP_PING;
-
+short ping(char* ip, short ttl, SOCKET sd, sockaddr_in &dest, sockaddr_in& source){
     unsigned int addr = inet_addr(ip);
-    if (addr != INADDR_NONE) {
-        // It was a dotted quad number, so save result
+    if (addr != INADDR_NONE)
         dest.sin_addr.s_addr = addr;
-    }
-    else {
-        // Not in dotted quad form, so try and look it up
-        hostent* hp = gethostbyname(ip);
-        if (hp != 0) {
-            // Found an address for that host, so save it
-            memcpy(&(dest.sin_addr), hp->h_addr, hp->h_length);
-        }
-        else {
-            // Not a recognized hostname either!
-            return IP_FAILED;
-        }
-    }
+    else
+        return IP_FAILED;
 
-
-    icmp_packet* packets_to_send[packets_qty];
+    vector<packets_time> packets_to_send(packets_qty);
     USHORT id = (USHORT)GetCurrentProcessId();
-
-    int times[packets_qty];
     for(int i=0; i<packets_qty; i++){
-        times[i] = 1;
+        packets_to_send[i].packet = new icmp_packet;
+        icmp_packet_init(packets_to_send[i].packet, ICMP_ECHO_REQUEST, 0, id, i);
+        packets_to_send[i].status = false;
     }
-
 
     fd_set read_s;
     struct timeval tv;
@@ -186,59 +136,57 @@ short ping(SOCKET sd, sockaddr_in &dest, sockaddr_in& source){
 
     int selectResult;
     short send_counter = 0;
-    while(!is_all_processed(times, packets_qty)){
-        int current_time = GetTickCount64();
-        if(!send_counter || (send_counter < packets_qty && current_time - times[send_counter-1] >= send_interval)){
-            FD_ZERO(&read_s);
-            FD_SET(sd, &read_s);
-            selectResult = select(0, NULL, &read_s, NULL, &tv);
-            if(selectResult > 0){
-                packets_to_send[send_counter] = new icmp_packet(ICMP_ECHO_REQUEST, 0, id, send_counter);
-                packets_to_send[send_counter]->send_packet(sd, dest);
-                times[send_counter] = GetTickCount64();
-                send_counter++;
-            }
-            else if (selectResult == SOCKET_ERROR){
-                return SELECT_FAILED;
-            }
+    while(!is_all_processed(packets_to_send, packets_qty)){
+        if(send_counter == 0 || (send_counter < packets_qty && GetTickCount64() - packets_to_send[send_counter-1].time >= send_interval)){
+
+            if(send_packet(packets_to_send[send_counter].packet, sd, dest) == SOCKET_ERROR)
+                return SEND_FAILED;
+
+            packets_to_send[send_counter].time = GetTickCount64();
+            send_counter++;
         }
+
         FD_ZERO(&read_s);
         FD_SET(sd, &read_s);
         selectResult = select(0, &read_s, NULL, NULL, &tv);
         if(selectResult > 0){
-            current_time = GetTickCount64();
-            ip_packet* recv_packet = new ip_packet;
-            recv_packet->recv_packet(sd, source);
+            BYTE recieve_buffer[max_data_size];
+            receive_packet(recieve_buffer, sd, source);
 
-            USHORT seq = recv_packet->icmp.type == ICMP_ECHO_REPLY ? recv_packet->icmp.seq : ((ip_packet*)recv_packet->icmp.data)->icmp.seq;
-            switch(recv_packet->icmp.type){
-                case ICMP_ECHO_REPLY:
-                    if(recv_packet->is_mine(ICMP_ECHO_REPLY, packets_to_send, times, packets_qty, seq)){
-                        cout<<"Reply from "<<ip<<": bytes="<<data_size<<" time="<<current_time - times[seq]<<"ms "
-                        <<"TTL="<<int(recv_packet->ttl)<<" seq="<<seq<<endl;
-                        times[seq] = 0;
+            ip_packet* received_packet = (ip_packet*)recieve_buffer;
+            BYTE type = received_packet->icmp.type;
+
+            vector<int> reply_ip;
+            if(received_packet->icmp.type != ICMP_ECHO_REPLY){
+                for(int i=0; i<4; i++)
+                    reply_ip.push_back((received_packet->source_ip >> (8 * (3 - i))) & 0xFF);
+                received_packet = (ip_packet*)(recieve_buffer+28);
+            }
+            USHORT seq = received_packet->icmp.seq;
+
+            if(IsEqualGUID(packets_to_send[seq].packet->data, received_packet->icmp.data)){
+                switch(type){
+                    case ICMP_ECHO_REPLY:
+                        cout<<"Reply from "<<ip<<": bytes="<<sizeof(icmp_packet)<<" time="<<GetTickCount64() - packets_to_send[seq].time<<"ms "
+                             <<"TTL="<<int(received_packet->ttl)<<" seq="<<seq<<endl;
                         break;
-                    }
-                case ICMP_DEST_UNREACH:
-                    if(recv_packet->is_mine(ICMP_DEST_UNREACH, packets_to_send, times, packets_qty, seq)){
-                        cout << "Destination unreachable seq=" << seq << endl;
-                        times[seq] = -1;
+                    case ICMP_DEST_UNREACH:
+                        cout<<"Reply from "<<reply_ip[0]<<"."<<reply_ip[1]<<"."<<reply_ip[2]<<"."<<reply_ip[3]<<": "
+                            <<"Destination unreachable seq=" << seq << endl;
                         break;
-                    }
-                case ICMP_TTL_EXPIRE:
-                    if(recv_packet->is_mine(ICMP_DEST_UNREACH, packets_to_send, times, packets_qty, seq)){
-                        cout << "TTL expired seq=" << seq << endl;
-                        times[seq] = -1;
+                    case ICMP_TTL_EXPIRE:
+                        cout<<"Reply from "<<reply_ip[0]<<"."<<reply_ip[1]<<"."<<reply_ip[2]<<"."<<reply_ip[3]<<": "
+                            <<"TTL expired seq=" << seq << endl;
                         break;
-                    }
+                }
+                packets_to_send[seq].status = true;
             }
         }
         else if(selectResult == 0){
-            current_time = GetTickCount64();
-            for(int i=0; i<packets_qty; i++){
-                if(times[i] != 1 && times[i] && times[i] != -1 && current_time - times[i] >= timeout){
-                    times[i] = -1;
+            for(int i=0; i<send_counter; i++){
+                if(!packets_to_send[i].status &&  GetTickCount64() - packets_to_send[i].time >= timeout){
                     cout<<"Timeout seq="<<i<<endl;
+                    packets_to_send[i].status = true;
                 }
             }
         }
@@ -247,11 +195,16 @@ short ping(SOCKET sd, sockaddr_in &dest, sockaddr_in& source){
         }
     }
 
-    print_stat(times, packets_qty, ip);
+    print_stat(packets_to_send, packets_qty, ip);
+
+    for(int i = 0; i < packets_qty; i++){
+        delete packets_to_send[i].packet;
+    }
+
     return PING_SUCCESS;
 }
 
-int main(){
+int main(int argc, char* argv[]){
     WSAData wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
         cout << "Failed to find Winsock 2.2 or better." << endl;
@@ -265,7 +218,7 @@ int main(){
         return -1;
     }
 
-    if (setsockopt(sd, IPPROTO_IP, IP_TTL, (const char*)&ttl, sizeof(ttl)) == SOCKET_ERROR) {
+    if (setsockopt(sd, IPPROTO_IP, IP_TTL, (const char*)&default_ttl, sizeof(default_ttl)) == SOCKET_ERROR) {
         cout << "TTL setsockopt failed: " << WSAGetLastError() << endl;
         return -1;
     }
@@ -280,25 +233,31 @@ int main(){
     memset(&dest, 0, sizeof(dest));
     dest.sin_family = AF_INET;
 
-    bool flag = true;
-    while(flag){
-        switch(ping(sd, dest, source)){
-            case PING_SUCCESS:
-                break;
-            case IP_FAILED:
-                cout << "Failed to resolve current ip" << endl;
-                flag = false;
-                break;
-            case SELECT_FAILED:
-                cout << "Select failed: " << WSAGetLastError() << endl;
-                flag = false;
-                break;
-            case STOP_PING:
-                cout << "Program stoped" << endl;
-                flag = false;
-                break;
-        }
+
+    int flag;
+    if(argc > 1){
+        flag = ping(argv[1], default_ttl, sd, dest, source);
     }
+    else{
+        char ip[16];
+        cout<<"IP for ping: ";
+        cin>>ip;
+        flag = ping(ip, default_ttl, sd, dest, source);
+    }
+
+
+    switch(flag){
+        case IP_FAILED:
+            cout << "Failed to resolve current ip" << endl;
+            break;
+        case SELECT_FAILED:
+            cout << "Select failed: " << WSAGetLastError() << endl;
+            break;
+        case SEND_FAILED:
+            cout << "Send failed: " << WSAGetLastError() << endl;
+            break;
+    }
+
     WSACleanup();
     return 0;
 }
