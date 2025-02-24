@@ -11,7 +11,7 @@ using namespace std;
 
 const short max_data_size = 72;
 const short packets_qty = 4;
-const short default_ttl = 2;
+const short default_ttl = 30;
 const short timeout = 4000;
 const short send_interval = 1000;
 
@@ -149,7 +149,7 @@ short ping(char* ip, short ttl, SOCKET sd, sockaddr_in &dest, sockaddr_in& sourc
         FD_ZERO(&read_s);
         FD_SET(sd, &read_s);
         selectResult = select(0, &read_s, NULL, NULL, &tv);
-        if(selectResult > 0){
+        if(FD_ISSET(sd, &read_s)){
             BYTE recieve_buffer[max_data_size];
             receive_packet(recieve_buffer, sd, source);
 
